@@ -2,22 +2,14 @@
 import argparse
 import binascii
 import json
+import logging
 import re
 import sys
+from collections.abc import Iterator
 from typing import Optional, List, Iterable, Dict, Any
 
 
-class DataRecord:
-
-    def __init__(self, data):
-        self._data = data
-
-    @property
-    def data(self):
-        return self._data
-
-    def __repr__(self):
-        return f'Data[{binascii.hexlify(self._data)}]'
+log = logging.getLogger(__name__)
 
 
 class LogDataScanner:
@@ -51,14 +43,19 @@ class LogDataScanner:
                         continue
             # not a match
             if len(data) > 0:
-                yield DataRecord(data=data)
+                yield data
                 data = b''
                 offset = 0
         if len(data) > 0:
-            yield DataRecord(data=data)
+            yield data
 
+
+class ParseError(Exception):
+    pass
 
 def _get_int(d, n):
+    if len(d) < n:
+        raise ParseError(f'get_int: {n} bytes needed, but data is {d}')
     if n == 1:
         dlen = d[0]
     else:
@@ -68,7 +65,8 @@ def _get_int(d, n):
 
 def _get_field(d, dlen):
     if dlen > 0:
-        assert len(d) >= dlen, f'field len={dlen}, but data len={len(d)}'
+        if len(d) < dlen:
+            raise ParseError(f'field len={dlen}, but data len={len(d)}')
         field = d[0:dlen]
         return d[dlen:], field
     return d, b''
@@ -153,6 +151,7 @@ class TlsSupportedGroups:
             return f'{cls.NAME_BY_ID[gid]}(0x{gid:0x})'
         return f'0x{gid:0x}'
 
+
 class TlsSignatureScheme:
     NAME_BY_ID = {
         0x0201: 'rsa_pkcs1_sha1',
@@ -206,13 +205,14 @@ class TlsCipherSuites:
         0x1303: 'TLS_CHACHA20_POLY1305_SHA256',
         0x1304: 'TLS_AES_128_CCM_SHA256',
         0x1305: 'TLS_AES_128_CCM_8_SHA256',
+        0x00ff: 'TLS_EMPTY_RENEGOTIATION_INFO_SCSV',
     }
 
     @classmethod
     def name(cls, cid):
         if cid in cls.NAME_BY_ID:
             return f'{cls.NAME_BY_ID[cid]}(0x{cid:0x})'
-        return f'0x{cid:0x}'
+        return f'Cipher(0x{cid:0x})'
 
 
 class PskKeyExchangeMode:
@@ -359,11 +359,10 @@ class ExtKeyShare(Extension):
             d, self._group = _get_int(d, 2)
         else:
             # list if key shares (group, pubkey)
-            while len(d) > 0:
-                sys.stderr.write(f'KEY_SHARE, parse {binascii.hexlify(d)}\n')
-                d, elen = _get_int(d, 2)
-                d, group = _get_int(d, 2)
-                d, pubkey = _get_len_field(d, 2)
+            d, shares = _get_len_field(d, 2)
+            while len(shares) > 0:
+                shares, group = _get_int(shares, 2)
+                shares, pubkey = _get_len_field(shares, 2)
                 self._keys.append({
                     'group': TlsSupportedGroups.name(group),
                     'pubkey': binascii.hexlify(pubkey).decode()
@@ -597,7 +596,6 @@ class ExtQuicTP(Extension):
         d = self.data
         self._params = []
         while len(d) > 0:
-            pdata = d
             d, ptype = _get_qint(d)
             d, plen = _get_qint(d)
             d, pvalue = _get_field(d, plen)
@@ -679,12 +677,19 @@ class TlsExtensions:
         return exts
 
 
+TlsExtensions.init()
+
+
 class HSRecord:
 
     def __init__(self, hsid: int, name: str, data):
-        self._hsid =  hsid
+        self._hsid = hsid
         self._name = name
         self._data = data
+
+    @property
+    def hsid(self):
+        return self._hsid
 
     @property
     def name(self):
@@ -712,7 +717,7 @@ class HSRecord:
         return f'{ind}{self._name}\n'\
                f'{ind}  id: 0x{self._hsid:0x}\n'\
                f'{ind}  data({len(self._data)}): '\
-                        f'{binascii.hexlify(self._data).decode()}'
+               f'{binascii.hexlify(self._data).decode()}'
 
 
 class ClientHello(HSRecord):
@@ -740,7 +745,7 @@ class ClientHello(HSRecord):
         jdata['session_id'] = binascii.hexlify(self._session_id).decode()
         jdata['ciphers'] = self._ciphers
         jdata['compressions'] = self._compressions
-        jdata['extensions'] = [ ext.to_json() for ext in self._extensions]
+        jdata['extensions'] = [ext.to_json() for ext in self._extensions]
         return jdata
 
     def to_text(self, indent: int = 0):
@@ -753,7 +758,6 @@ class ClientHello(HSRecord):
             f'{ind}  compressions: {self._compressions}\n'\
             f'{ind}  extensions: \n' + '\n'.join(
                 [ext.to_text(indent=indent+4) for ext in self._extensions])
-
 
 
 class ServerHello(HSRecord):
@@ -784,7 +788,7 @@ class ServerHello(HSRecord):
         jdata['session_id'] = binascii.hexlify(self._session_id).decode()
         jdata['cipher'] = self._cipher
         jdata['compression'] = int(self._compression)
-        jdata['extensions'] = [ ext.to_json() for ext in self._extensions]
+        jdata['extensions'] = [ext.to_json() for ext in self._extensions]
         return jdata
 
     def to_text(self, indent: int = 0):
@@ -809,7 +813,7 @@ class EncryptedExtensions(HSRecord):
 
     def to_json(self):
         jdata = super().to_json()
-        jdata['extensions'] = [ ext.to_json() for ext in self._extensions]
+        jdata['extensions'] = [ext.to_json() for ext in self._extensions]
         return jdata
 
     def to_text(self, indent: int = 0):
@@ -817,6 +821,69 @@ class EncryptedExtensions(HSRecord):
         return super().to_text(indent=indent) + '\n'\
             f'{ind}  extensions: \n' + '\n'.join(
                 [ext.to_text(indent=indent+4) for ext in self._extensions])
+
+
+class CertificateRequest(HSRecord):
+
+    def __init__(self, hsid: int, name: str, data):
+        super().__init__(hsid=hsid, name=name, data=data)
+        d = data
+        d, self._context = _get_int(d, 1)
+        d, edata = _get_len_field(d, 2)
+        self._extensions = TlsExtensions.from_data(hsid, edata)
+
+    def to_json(self):
+        jdata = super().to_json()
+        jdata['context'] = self._context
+        jdata['extensions'] = [ext.to_json() for ext in self._extensions]
+        return jdata
+
+    def to_text(self, indent: int = 0):
+        ind = ' ' * (indent + 2)
+        return super().to_text(indent=indent) + '\n'\
+            f'{ind}  context: {self._context}\n'\
+            f'{ind}  extensions: \n' + '\n'.join(
+                [ext.to_text(indent=indent+4) for ext in self._extensions])
+
+
+class Certificate(HSRecord):
+
+    def __init__(self, hsid: int, name: str, data):
+        super().__init__(hsid=hsid, name=name, data=data)
+        d = data
+        d, self._context = _get_int(d, 1)
+        d, clist = _get_len_field(d, 3)
+        self._cert_entries = []
+        while len(clist) > 0:
+            clist, cert_data = _get_len_field(clist, 3)
+            clist, cert_exts = _get_len_field(clist, 2)
+            exts = TlsExtensions.from_data(hsid, cert_exts)
+            self._cert_entries.append({
+                'cert': binascii.hexlify(cert_data).decode(),
+                'extensions': exts,
+            })
+
+    def to_json(self):
+        jdata = super().to_json()
+        jdata['context'] = self._context
+        jdata['certificate_list'] = [{
+            'cert': e['cert'],
+            'extensions': [x.to_json() for x in e['extensions']],
+        } for e in self._cert_entries]
+        return jdata
+
+    def _enxtry_text(self, e, indent: int = 0):
+        ind = ' ' * (indent + 2)
+        return f'{ind} cert: {e["cert"]}\n'\
+               f'{ind}  extensions: \n' + '\n'.join(
+            [x.to_text(indent=indent + 4) for x in e['extensions']])
+
+    def to_text(self, indent: int = 0):
+        ind = ' ' * (indent + 2)
+        return super().to_text(indent=indent) + '\n'\
+            f'{ind}  context: {self._context}\n'\
+            f'{ind}  certificate_list: \n' + '\n'.join(
+                [self._enxtry_text(e, indent+4) for e in self._cert_entries])
 
 
 class SessionTicket(HSRecord):
@@ -837,8 +904,26 @@ class SessionTicket(HSRecord):
         jdata['age'] = self._age
         jdata['nonce'] = binascii.hexlify(self._nonce).decode()
         jdata['ticket'] = binascii.hexlify(self._ticket).decode()
-        jdata['extensions'] = [ ext.to_json() for ext in self._extensions]
+        jdata['extensions'] = [ext.to_json() for ext in self._extensions]
         return jdata
+
+
+class HSIterator(Iterator):
+
+    def __init__(self, recs):
+        self._recs = recs
+        self._index = 0
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        try:
+            result = self._recs[self._index]
+        except IndexError:
+            raise StopIteration
+        self._index += 1
+        return result
 
 
 class HandShake:
@@ -850,9 +935,9 @@ class HandShake:
         (5, 'EndOfEarlyData', HSRecord),
         (6, 'HelloRetryRequest', ServerHello),
         (8, 'EncryptedExtensions', EncryptedExtensions),
-        (11, 'Certificate', HSRecord),
+        (11, 'Certificate', Certificate),
         (12, 'ServerKeyExchange ', HSRecord),
-        (13, 'CertificateRequest', HSRecord),
+        (13, 'CertificateRequest', CertificateRequest),
         (14, 'ServerHelloDone', HSRecord),
         (15, 'CertificateVerify', HSRecord),
         (16, 'ClientKeyExchange', HSRecord),
@@ -864,48 +949,65 @@ class HandShake:
     RT_CLS_BY_ID = {}
 
     @classmethod
-    def init(cls):
-        for (id, name, rcls) in cls.REC_TYPES:
-            cls.RT_NAME_BY_ID[id] = name
-            cls.RT_CLS_BY_ID[id] = rcls
-
-    def __init__(self, source: Iterable[DataRecord], strict: bool = False):
-        self._source = source
-        self._strict = strict
-
-    def __iter__(self):
+    def _parse(cls, source, strict=False, verbose: int = 0):
         d = b''
         hsid = 0
-        for r in self._source:
-            d += r.data
+        hsrecs = []
+        if verbose > 0:
+            log.debug(f'scanning for handshake records')
+        for data in source:
+            if verbose > 3:
+                log.debug(f'inspecting data {data}')
+            d += data
             while len(d) > 0:
-                hsdata, hsid = _get_int(d, 1)
-                if hsid not in self.RT_CLS_BY_ID:
-                    if self._strict:
-                        raise Exception(
-                            f'Not a known Handshake record type: {hsid}')
-                    d = hsdata
+                try:
+                    hsdata, hsid = _get_int(d, 1)
+                    if hsid not in cls.RT_CLS_BY_ID:
+                        raise ParseError(f'unknown type {hsid}')
+                    hsdata, rec_len = _get_int(hsdata, 3)
+                    if rec_len > len(hsdata):
+                        # incomplete, need more data
+                        break
+                    d, rec_data = _get_field(hsdata, rec_len)
+                    if hsid in cls.RT_CLS_BY_ID:
+                        name = cls.RT_NAME_BY_ID[hsid]
+                        rcls = cls.RT_CLS_BY_ID[hsid]
+                    else:
+                        name = f'CryptoRecord(0x{hsid:0x})'
+                        rcls = HSRecord
+                    r = rcls(hsid=hsid, name=name, data=rec_data)
+                    hsrecs.append(r)
+                    if verbose > 2:
+                        log.debug(f'added record: {r.to_text()}')
+                except ParseError as err:
+                    d = b''
+                    log.warning(f'parsing suspected crypto record: {err}')
                     break
-                hsdata, rec_len = _get_int(hsdata, 3)
-                if rec_len > len(hsdata):
-                    # incomplete, need more data
-                    break
-                d, rec_data = _get_field(hsdata, rec_len)
-                if hsid in self.RT_CLS_BY_ID:
-                    name = self.RT_NAME_BY_ID[hsid]
-                    rcls = self.RT_CLS_BY_ID[hsid]
-                else:
-                    name = f'CryptoRecord(0x{hsid:0x})'
-                    rcls = HSRecord
-                yield rcls(hsid=hsid, name=name, data=rec_data)
-        if len(d) > 0 and self._strict:
+        if len(d) > 0 and strict:
             raise Exception(f'possibly incomplete handshake record '
-                            f'id={hsid}, data_len={len(d)} from raw={d}\n')
+                            f'id={hsid}, data_len={len(d)} from raw={d}')
+        return hsrecs
+
 
 
     @classmethod
-    def from_data(cls, raw: List[DataRecord]) -> Optional[List['HSRecord']]:
-        return [r for r in HandShake(source=raw)]
+    def init(cls):
+        for (hsid, name, rcls) in cls.REC_TYPES:
+            cls.RT_NAME_BY_ID[hsid] = name
+            cls.RT_CLS_BY_ID[hsid] = rcls
+
+    def __init__(self, source: Iterable[bytes], strict: bool = False,
+                 verbose: int = 0):
+        self._source = source
+        self._strict = strict
+        self._verbose = verbose
+
+    def __iter__(self):
+        return HSIterator(recs=self._parse(self._source, strict=self._strict,
+                                           verbose=self._verbose))
+
+
+HandShake.init()
 
 
 if __name__ == '__main__':
@@ -914,18 +1016,26 @@ if __name__ == '__main__':
         """)
     parser.add_argument("-j", "--json", default=False, action='store_true',
                         help="output record in JSON format")
+    parser.add_argument("-v", "--verbose", default=0, action='count',
+                        help="verbosity of logging")
     parser.add_argument('log_file', help="log file to parse", default='-',
                         nargs='?')
 
-    TlsExtensions.init()
-    HandShake.init()
     args = parser.parse_args()
+
+    console = logging.StreamHandler()
+    console.setFormatter(logging.Formatter('%(levelname)s: %(message)s'))
+    logging.getLogger('').addHandler(console)
+    level = logging.DEBUG if args.verbose > 0 else logging.INFO
+    console.setLevel(level)
+    logging.getLogger('').setLevel(level=level)
+
     if args.log_file == '-':
         fd = sys.stdin
     else:
         fd = open(args.log_file)
 
-    for hsr in HandShake(source=LogDataScanner(fd=fd)):
+    for hsr in HandShake(source=LogDataScanner(fd=fd), verbose=args.verbose):
         if args.json:
             json.dump(hsr.to_json(), sys.stdout, indent=2)
         else:
